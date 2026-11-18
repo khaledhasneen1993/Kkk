@@ -249,6 +249,9 @@ class Engine:
                 candidates.append((edge,side,token,limit,budget,ask))
         return max(candidates) if candidates else "تخطي · الأفضلية أو السيولة أو السبريد أو ضغط البيع"
 
+    def reference_fresh(self):
+        return 0 <= utc_ms()-max(self.o.points,default=0) <= self.f.limit
+
     async def execute(self, signal):
         edge,side,token,limit,budget,ask = signal
         w = self.f.window
@@ -259,7 +262,7 @@ class Engine:
         f=self.f
         if (not f.window or f.window.start!=w.start or not f.feeds_fresh()
                 or self.risk.budget(minimum,w.start)<budget
-                or not 0<=utc_ms()-max(self.o.points,default=0)<=f.limit):
+                or not self.reference_fresh()):
             self.l.record("reject",w.start,reason="stale, risk or rollover on arrival")
             return
         book=f.books[token]
@@ -343,9 +346,46 @@ class Engine:
             await asyncio.sleep(.2)
 
 
+class ExternalPaper(Engine):
+    """Public-book execution experiment. Alternate sides to sample both books."""
+    def reference_fresh(self):
+        return self.f.feeds_fresh()
+
+    def propose(self):
+        f, w = self.f, self.f.window
+        if not w or not f.feeds_fresh():
+            return "انتظار الأسعار العامة ودفترَي الأوامر"
+        if w.start in self.l.attempted:
+            return "تمت محاولة تنفيذ لهذه النافذة"
+        if w.start not in self.meta:
+            return "انتظار رسوم السوق والحد الأدنى"
+        if (w.start+300)*1000-utc_ms() < 5000+self.wire:
+            return "الوقت المتبقي غير كافٍ للتنفيذ"
+        rate, minimum = self.meta[w.start]
+        budget = self.risk.budget(minimum,w.start)
+        if not budget:
+            return f"تخطّي: قيود المخاطرة أو الحد الأدنى للسوق {minimum} دولار"
+        side, token = ("Up",w.up) if (w.start//300)%2==0 else ("Down",w.down)
+        book = f.books[token]
+        if not book.asks or not book.bids:
+            return "انتظار سيولة على جهتي الدفتر"
+        ask, bid = min(book.asks), max(book.bids)
+        if not ZERO < bid < ask < ONE or ask-bid>D(".04"):
+            return "تخطّي: السبريد"
+        limit = min(ONE,ask*D("1.005"))
+        qty,cost,fee = sweep(book,limit,budget,rate)
+        if not qty or cost<minimum or cost+fee<budget*D(".98"):
+            return "تخطّي: السيولة المتاحة غير كافية"
+        self.features = dict(mode="public_execution_test",side=side,spot=str(f.spot[1]))
+        return None,side,token,limit,budget,ask
+
+
 async def main(args):
     f,l,o=Feeds(),Ledger(args.db),Oracle()
-    e=Engine(f,l,o,args.wire_ms,args.ack_ms,args.ewma)
+    cls = ExternalPaper if args.external else Engine
+    e=cls(f,l,o,args.wire_ms,args.ack_ms,args.ewma)
+    if args.external:
+        o.status="تجربة تنفيذ خارجية على الدفتر العام"
     activity=Activity()
     logging.basicConfig(level=logging.INFO,handlers=[activity,logging.StreamHandler(),
         RotatingFileHandler("feeds.log",maxBytes=2000000,backupCount=3)])
@@ -374,6 +414,8 @@ async def main(args):
       model:s.features,realized:s.realized,skip_pct:s.skip_pct,positions:s.positions,
       recent:s.trades},null,2));put('events',""")
     page=page.replace("قيمة الحساب","القيمة التقديرية (آخر شراء أو تكلفة)")
+    if args.external:
+        page=page.replace("BTC · متابعة المحاكاة الورقية","BTC · محاكاة تنفيذ خارجية | بيانات عامة")
     async def home(request):
         return web.Response(text=page,content_type="text/html")
     app=web.Application()
@@ -385,7 +427,9 @@ async def main(args):
         LOG.info("PAPER ONLY http://127.0.0.1:%d cash=%s",args.port,l.cash)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
             async with asyncio.TaskGroup() as g:
-                for coro in (f.run(),o.run(http),e.markets(http),e.loop()):
+                if not args.external:
+                    g.create_task(o.run(http))
+                for coro in (f.run(),e.markets(http),e.loop()):
                     g.create_task(coro)
     finally:
         await runner.cleanup()
@@ -394,13 +438,17 @@ async def main(args):
 
 if __name__=="__main__":
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ask-data",action="store_true",help="prompt locally for reference-feed access")
-    p.add_argument("--db",default="paper35.sqlite")
+    modes=p.add_mutually_exclusive_group()
+    modes.add_argument("--external",action="store_true",help="public book execution experiment without credentials")
+    modes.add_argument("--ask-data",action="store_true",help="prompt locally for reference-feed access")
+    p.add_argument("--db")
     p.add_argument("--port",type=int,default=8765)
     p.add_argument("--ewma",type=number,default=D(".94"))
     p.add_argument("--wire-ms",type=int,default=650)
     p.add_argument("--ack-ms",type=int,default=350)
     args=p.parse_args()
+    if args.db is None:
+        args.db="external35.sqlite" if args.external else "paper35.sqlite"
     if not ZERO<args.ewma<ONE:
         p.error("EWMA decay must lie between 0 and 1")
     if args.ask_data:
