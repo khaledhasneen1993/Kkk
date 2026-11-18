@@ -108,11 +108,24 @@ class Book:
     bids: dict[Decimal, Decimal] = field(default_factory=dict)
     asks: dict[Decimal, Decimal] = field(default_factory=dict)
 
-    def level(self, side: str, row: dict) -> None:
+    snapshot_ms: int = field(init=False)
+    updates: dict[tuple[str, Decimal], int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.snapshot_ms = self.stamp.source
+
+    def level(self, side: str, row: dict, update: Stamp | None = None) -> None:
         levels = {"BUY": self.bids, "SELL": self.asks}[side]
         p, q = number(row["price"]), number(row["size"])
         if not (0 <= p <= 1 and q >= 0):
             raise ValueError("bad book level")
+        if update is not None:
+            key = (side, p)
+            if update.source < self.updates.get(key, self.snapshot_ms):
+                return
+            self.updates[key] = update.source  # Retain deletions until the next snapshot.
+            if update.source > self.stamp.source:
+                self.stamp = update
         if q:
             levels[p] = q
         else:
@@ -243,19 +256,25 @@ class Feeds:
             if token not in (w.up, w.down):
                 raise ValueError("wrong asset")
             b = self.books.get(token)
-            if b and stamp.source < b.stamp.source:
-                raise ValueError("out-of-order depth")
             if kind == "book":
+                if b and stamp.source < b.snapshot_ms:
+                    continue
+                prior = b
                 b = Book(stamp)
                 for side, key in (("BUY", "bids"), ("SELL", "asks")):
                     for level in row[key]:
                         b.level(side, level)
+                if prior and prior.stamp.source > stamp.source:
+                    for (side, price), ts in prior.updates.items():
+                        if ts > stamp.source:
+                            levels = prior.bids if side == "BUY" else prior.asks
+                            b.level(side, {"price": price, "size": levels.get(price, 0)}, Stamp(ts))
+                    b.stamp = prior.stamp
                 self.books[token] = b
             elif b is None:
                 raise ValueError("delta before snapshot")
             else:
-                b.level(row["side"], row)
-                b.stamp = stamp
+                b.level(row["side"], row, stamp)
         self.changed.set()
 
     async def prefetch(self, client: aiohttp.ClientSession, start: int) -> None:
